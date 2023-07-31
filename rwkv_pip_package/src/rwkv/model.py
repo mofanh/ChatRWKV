@@ -2,6 +2,7 @@
 # The RWKV Language Model - https://github.com/BlinkDL/RWKV-LM
 ########################################################################################################
 
+from typing import Optional
 import types, gc, os, time, re
 import torch
 from torch.nn import functional as F
@@ -26,12 +27,24 @@ else:
 
 if os.environ.get('RWKV_CUDA_ON') == '1':
     from torch.utils.cpp_extension import load
-    load(
-        name=f"wkv_cuda",
-        sources=[f"{current_path}/cuda/wrapper.cpp", f"{current_path}/cuda/operators.cu"],
-        verbose=True,
-        extra_cuda_cflags=["-t 4", "-std=c++17", "--use_fast_math", "-O3", "--extra-device-vectorization"],
-        is_python_module=False)
+    try:
+        load(
+            name=f"wkv_cuda",
+            sources=[f"{current_path}/cuda/wrapper.cpp", f"{current_path}/cuda/operators.cu", f"{current_path}/cuda/gemm_fp16_cublas.cpp"],
+            verbose=True,
+            extra_cuda_cflags=["-t 4", "-std=c++17", "--use_fast_math", "-O3", "--extra-device-vectorization"],
+            is_python_module=False)
+        DISABLE_CUBLAS_GEMM = False
+    except:
+        print("Failed to build cuBLAS matmul, falling back to torch.matmul. Small model with fp16 will overflow.")
+        load(
+            name=f"wkv_cuda",
+            sources=[f"{current_path}/cuda/wrapper.cpp", f"{current_path}/cuda/operators.cu"],
+            verbose=True,
+            extra_cuda_cflags=["-t 4", "-std=c++17", "--use_fast_math", "-O3", "--extra-device-vectorization"],
+            extra_cflags=["-DDISABLE_CUBLAS_GEMM"],
+            is_python_module=False)
+        DISABLE_CUBLAS_GEMM = True
 
     @MyStatic
     def cuda_wkv(T: int, C: int, w, u, k, v, aa, bb, pp):
@@ -50,10 +63,10 @@ if os.environ.get('RWKV_CUDA_ON') == '1':
         assert x.dtype == mx.dtype == rx.dtype == my.dtype == ry.dtype
         assert x.dtype == torch.float32 or x.dtype == torch.float16
         assert w.dtype == torch.uint8
-        assert x.shape == [B, N]
-        assert w.shape == [N, M]
-        assert rx.shape == mx.shape == [M]
-        assert ry.shape == my.shape == [N, 1]
+        assert x.shape == (B, N)
+        assert w.shape == (N, M)
+        assert rx.shape == mx.shape == (M,)
+        assert ry.shape == my.shape == (N, 1)
         y = torch.empty((B, M), device=w.device, dtype=x.dtype)
         torch.ops.rwkv.mm8_seq(B, N, M, x, w, mx, rx, my, ry, y)
         return y
@@ -62,15 +75,43 @@ if os.environ.get('RWKV_CUDA_ON') == '1':
         assert x.dtype == mx.dtype == rx.dtype == my.dtype == ry.dtype
         assert x.dtype == torch.float32 or x.dtype == torch.float16
         assert w.dtype == torch.uint8
-        assert x.shape == [N]
-        assert w.shape == [N, M]
-        assert rx.shape == mx.shape == [M]
-        assert ry.shape == my.shape == [N, 1]
+        assert x.shape == (N,)
+        assert w.shape == (N, M)
+        assert rx.shape == mx.shape == (M,)
+        assert ry.shape == my.shape == (N, 1)
         y = torch.zeros((M,), device=w.device, dtype=torch.float32)
         torch.ops.rwkv.mm8_one(N, M, x, w, mx, rx, my, ry, y)
         return y.to(dtype=x.dtype)
 else:
     os.environ["RWKV_CUDA_ON"] = '0'
+
+if os.environ.get('RWKV_CUDA_ON') == '1' and not DISABLE_CUBLAS_GEMM:
+    @MyStatic
+    def gemm(a, b, output_dtype: Optional[torch.dtype]=None):
+        if output_dtype is None:
+            output_dtype = a.dtype
+        if a.dtype == b.dtype == torch.float16 and a.device.type == 'cuda':
+            if len(a.shape) == 1:
+                assert len(b.shape) == 2
+                c = torch.empty((b.shape[-1],), dtype=output_dtype, device=a.device)
+                a = a.unsqueeze(0)
+            else:
+                assert len(a.shape) == len(b.shape)
+                assert len(a.shape) == 2 or len(a.shape) == 3
+                # torch.empty((*a.shape[:-1], b.shape[-1])) doesn't work with jit
+                if len(a.shape) == 2:
+                    c = torch.empty((a.shape[0], b.shape[-1]), dtype=output_dtype, device=a.device)
+                else:
+                    c = torch.empty((a.shape[0], a.shape[1], b.shape[-1]), dtype=output_dtype, device=a.device)
+            torch.ops.rwkv.gemm_fp16_cublas(a, b, c)
+            return c
+        else:
+            return (a @ b).to(output_dtype)
+else:
+    def gemm(a, b, output_dtype: Optional[torch.dtype]=None):
+        if output_dtype is None:
+            output_dtype = a.dtype
+        return (a @ b).to(output_dtype)
 
 ########################################################################################################
 
@@ -120,9 +161,14 @@ class RWKV(MyModule):
             args.n_embd = w['emb.weight'].shape[1]
             args.n_layer = 0
             keys = list(w.keys())
+            self.version = 4
             for x in keys:
                 layer_id = int(x.split('.')[1]) if ('blocks.' in x) else 0
                 args.n_layer = max(args.n_layer, layer_id+1)
+                if 'ln_x' in x:
+                    self.version = 5
+                if self.version == 5 and 'att.time_decay' in x:
+                    args.n_head = w[x].shape[0]
 
             ####################### Compute strategy
 
@@ -227,8 +273,16 @@ class RWKV(MyModule):
                         w[x] = w[x].t()
 
                     if '.time_decay' in x: # need fp32 for this
-                        w[x] = -torch.exp(w[x].float())
+                        if self.version == 4:
+                            w[x] = -torch.exp(w[x].float())
+                        elif self.version == 5:
+                            w[x] = torch.exp(-torch.exp(w[x].float())).reshape(-1,1,1)
                     elif '.time_first' in x: # need fp32 for this
+                        if self.version == 4:
+                            w[x] = w[x].float()
+                        elif self.version == 5:
+                            w[x] = torch.exp(w[x].float()).reshape(-1,1,1)
+                    elif '.ln_x' in x: # need fp32 for group_norm
                         w[x] = w[x].float()
                     else:
                         if (len(w[x].shape) == 2) and ('emb' not in x):
@@ -359,9 +413,9 @@ class RWKV(MyModule):
         kx = xx * k_mix + sx * (1 - k_mix)
         rx = xx * r_mix + sx * (1 - r_mix)
 
-        r = torch.sigmoid(rx @ rw)
-        vx = torch.square(torch.relu(kx @ kw))
-        out = r * (vx @ vw)
+        r = torch.sigmoid(gemm(rx, rw))
+        vx = torch.square(torch.relu(gemm(kx, kw)))
+        out = r * gemm(vx, vw)
         return x + out, xx
 
     @MyFunction
@@ -384,9 +438,9 @@ class RWKV(MyModule):
         kx = xx * k_mix + sx * (1 - k_mix)
         rx = xx * r_mix + sx * (1 - r_mix)
 
-        r = torch.sigmoid(rx @ rw)
-        vx = torch.square(torch.relu(kx @ kw))
-        out = r * (vx @ vw)
+        r = torch.sigmoid(gemm(rx, rw))
+        vx = torch.square(torch.relu(gemm(kx, kw)))
+        out = r * gemm(vx, vw)
         return x + out, xx[-1,:]
 
     @MyFunction
@@ -410,9 +464,9 @@ class RWKV(MyModule):
         vx = xx * v_mix + sx * (1 - v_mix)
         rx = xx * r_mix + sx * (1 - r_mix)
 
-        r = torch.sigmoid(rx @ rw)
-        k = (kx @ kw).float()
-        v = (vx @ vw).float()
+        r = torch.sigmoid(gemm(rx, rw))
+        k = gemm(kx, kw, output_dtype=torch.float32)
+        v = gemm(vx, vw, output_dtype=torch.float32)
 
         ww = t_first + k
         p = torch.maximum(pp, ww)
@@ -424,7 +478,7 @@ class RWKV(MyModule):
         e1 = torch.exp(ww - p)
         e2 = torch.exp(k - p)
 
-        out = (r * wkv) @ ow
+        out = gemm(r * wkv, ow)
         return x + out, xx, e1 * aa + e2 * v, e1 * bb + e2, p
 
     @MyFunction
@@ -461,9 +515,9 @@ class RWKV(MyModule):
         vx = xx * v_mix + sx * (1 - v_mix)
         rx = xx * r_mix + sx * (1 - r_mix)
 
-        r = torch.sigmoid(rx @ rw)
-        k = (kx @ kw).float()
-        v = (vx @ vw).float()
+        r = torch.sigmoid(gemm(rx, rw))
+        k = gemm(kx, kw, output_dtype=torch.float32)
+        v = gemm(vx, vw, output_dtype=torch.float32)
 
         T = x.shape[0]
         for t in range(T):
@@ -481,7 +535,7 @@ class RWKV(MyModule):
             aa = e1 * aa + e2 * vv
             bb = e1 * bb + e2
             pp = p
-        out = (r * sx) @ ow
+        out = gemm(r * sx, ow)
         return x + out, xx[-1,:], aa, bb, pp
 
     @MyFunction
@@ -517,6 +571,72 @@ class RWKV(MyModule):
 
     ########################################################################################################
 
+    @MyFunction
+    def att_one_v5(self, x, sx, s, ln_w, ln_b, lx_w, lx_b, k_mix, v_mix, r_mix, t_decay, t_first, kw, vw, rw, ow, kmx, krx, kmy, kry, vmx, vrx, vmy, vry, rmx, rrx, rmy, rry, omx, orx, omy, ory):
+        xx = F.layer_norm(x, (x.shape[-1],), weight=ln_w, bias=ln_b)
+        kx = xx * k_mix + sx * (1 - k_mix)
+        vx = xx * v_mix + sx * (1 - v_mix)
+        rx = xx * r_mix + sx * (1 - r_mix)
+
+        H = t_decay.shape[0]
+        S = x.shape[-1] // H
+
+        r = gemm(rx, rw, output_dtype=torch.float32).view(H, 1, S)
+        k = gemm(kx, kw, output_dtype=torch.float32).view(H, S, 1)
+        v = gemm(vx, vw, output_dtype=torch.float32).view(H, 1, S)
+        
+        a = gemm(k, v)
+        out = r @ (t_first * a + s)
+        s = a + t_decay * s
+
+        out = out.flatten()
+        out = F.group_norm(out.unsqueeze(0), num_groups=H, weight=lx_w, bias=lx_b).squeeze(0)
+        out = out.to(dtype=x.dtype)
+        out = gemm(out, ow)
+
+        return x + out, xx, s
+
+    @MyFunction
+    def att_seq_v5(self, x, sx, s, ln_w, ln_b, lx_w, lx_b, k_mix, v_mix, r_mix, t_decay, t_first, kw, vw, rw, ow, kmx, krx, kmy, kry, vmx, vrx, vmy, vry, rmx, rrx, rmy, rry, omx, orx, omy, ory):
+        xx = F.layer_norm(x, (x.shape[-1],), weight=ln_w, bias=ln_b)
+        sx = torch.cat((sx.unsqueeze(0), xx[:-1,:]))
+        kx = xx * k_mix + sx * (1 - k_mix)
+        vx = xx * v_mix + sx * (1 - v_mix)
+        rx = xx * r_mix + sx * (1 - r_mix)
+
+        H = t_decay.shape[0]
+        S = x.shape[-1] // H
+        T = x.shape[0]
+
+        w = t_decay.reshape(-1, 1)
+        u = t_first.reshape(-1, 1)
+        ws = w.pow(T).reshape(H, 1, 1)
+        ind = torch.arange(T-1, -1, -1, device=w.device).unsqueeze(0).repeat(H, 1)
+        w = w.repeat(1, T).pow(ind)
+        wk = w.reshape(H, 1, T)
+        wb = wk.transpose(-2, -1).flip(1)
+        w = torch.cat([w[:, 1:], u], dim=1)
+        w = F.pad(w, (0, T))
+        w = torch.tile(w, [T])
+        w = w[:, :-T].reshape(-1, T, 2 * T - 1)
+        w = w[:, :, T-1:].reshape(H, T, T)
+
+        r = gemm(rx, rw, output_dtype=torch.float32).view(T, H, S).transpose(0, 1)
+        k = gemm(kx, kw, output_dtype=torch.float32).view(T, H, S).transpose(0, 1).transpose(-2, -1)
+        v = gemm(vx, vw, output_dtype=torch.float32).view(T, H, S).transpose(0, 1)
+
+        out = ((r @ k) * w) @ v + (r @ s) * wb
+        s = ws * s + (k * wk) @ v
+        
+        out = out.transpose(0, 1).contiguous().reshape(T, H*S)
+        out = F.group_norm(out, num_groups=H, weight=lx_w, bias=lx_b)
+        out = out.to(dtype=x.dtype)
+        out = gemm(out, ow)
+
+        return x + out, xx[-1,:], s
+
+    ########################################################################################################
+
     if os.environ["RWKV_CUDA_ON"] == '1':
         @MyFunction
         def cuda_att_seq(self, x, sx, aa, bb, pp, ln_w, ln_b, k_mix, v_mix, r_mix, t_decay, t_first, kw, vw, rw, ow, kmx, krx, kmy, kry, vmx, vrx, vmy, vry, rmx, rrx, rmy, rry, omx, orx, omy, ory):
@@ -527,12 +647,12 @@ class RWKV(MyModule):
             vx = xx * v_mix + sx * (1 - v_mix)
             rx = xx * r_mix + sx * (1 - r_mix)
 
-            r = torch.sigmoid(rx @ rw)
-            k = kx @ kw
-            v = vx @ vw
+            r = torch.sigmoid(gemm(rx, rw))
+            k = gemm(kx, kw, output_dtype=torch.float32)
+            v = gemm(vx, vw, output_dtype=torch.float32)
             y, aa, bb, pp = cuda_wkv(T, C, t_decay, t_first, k, v, aa, bb, pp)
             
-            out = (r * y) @ ow
+            out = gemm(r * y.to(x.dtype), ow)
             return x + out, xx[-1,:], aa, bb, pp
 
         @MyFunction
@@ -560,16 +680,26 @@ class RWKV(MyModule):
             args = self.args
 
             if state == None:
-                state = [None] * args.n_layer * 5
-                for i in range(args.n_layer): # state: 0=att_xx 1=att_aa 2=att_bb 3=att_pp 4=ffn_xx
-                    dd = self.strategy[i]
-                    dev = dd.device
-                    atype = dd.atype
-                    state[i*5+0] = torch.zeros(args.n_embd, dtype=atype, requires_grad=False, device=dev).contiguous()
-                    state[i*5+1] = torch.zeros(args.n_embd, dtype=torch.float, requires_grad=False, device=dev).contiguous()
-                    state[i*5+2] = torch.zeros(args.n_embd, dtype=torch.float, requires_grad=False, device=dev).contiguous()
-                    state[i*5+3] = torch.zeros(args.n_embd, dtype=torch.float, requires_grad=False, device=dev).contiguous() - 1e30
-                    state[i*5+4] = torch.zeros(args.n_embd, dtype=atype, requires_grad=False, device=dev).contiguous()
+                if self.version == 4:
+                    state = [None] * args.n_layer * 5
+                    for i in range(args.n_layer): # state: 0=att_xx 1=att_aa 2=att_bb 3=att_pp 4=ffn_xx
+                        dd = self.strategy[i]
+                        dev = dd.device
+                        atype = dd.atype
+                        state[i*5+0] = torch.zeros(args.n_embd, dtype=atype, requires_grad=False, device=dev).contiguous()
+                        state[i*5+1] = torch.zeros(args.n_embd, dtype=torch.float, requires_grad=False, device=dev).contiguous()
+                        state[i*5+2] = torch.zeros(args.n_embd, dtype=torch.float, requires_grad=False, device=dev).contiguous()
+                        state[i*5+3] = torch.zeros(args.n_embd, dtype=torch.float, requires_grad=False, device=dev).contiguous() - 1e30
+                        state[i*5+4] = torch.zeros(args.n_embd, dtype=atype, requires_grad=False, device=dev).contiguous()
+                elif self.version == 5:
+                    state = [None] * args.n_layer * 3
+                    for i in range(args.n_layer): # state: 0=att_xx 1=att_kv 2=ffn_xx
+                        dd = self.strategy[i]
+                        dev = dd.device
+                        atype = dd.atype
+                        state[i*3+0] = torch.zeros(args.n_embd, dtype=atype, requires_grad=False, device=dev).contiguous()
+                        state[i*3+1] = torch.zeros((args.n_head, args.n_embd//args.n_head, args.n_embd//args.n_head), dtype=torch.float, requires_grad=False, device=dev).contiguous()
+                        state[i*3+2] = torch.zeros(args.n_embd, dtype=atype, requires_grad=False, device=dev).contiguous()
 
             seq_mode = len(tokens) > 1
 
@@ -588,9 +718,13 @@ class RWKV(MyModule):
                         ATT = self.cuda_att_seq if wtype != torch.uint8 else self.cuda_att_seq_i8
                     else:
                         ATT = self.att_seq if wtype != torch.uint8 else self.att_seq_i8
+                    if self.version == 5:
+                        ATT = self.att_seq_v5
                     FFN = self.ffn_seq if wtype != torch.uint8 else self.ffn_seq_i8
                 else:
                     ATT = self.att_one if wtype != torch.uint8 else self.att_one_i8
+                    if self.version == 5:
+                        ATT = self.att_one_v5
                     FFN = self.ffn_one if wtype != torch.uint8 else self.ffn_one_i8
 
                 x = x.to(dtype=atype, device=dev)
@@ -620,17 +754,31 @@ class RWKV(MyModule):
                 orx = w[f'{att}output.weight_rx'] if wtype == torch.uint8 else x
                 omy = w[f'{att}output.weight_my'] if wtype == torch.uint8 else x
                 ory = w[f'{att}output.weight_ry'] if wtype == torch.uint8 else x
-                x, state[i*5+0], state[i*5+1], state[i*5+2], state[i*5+3] = ATT(
-                    x, state[i*5+0], state[i*5+1], state[i*5+2], state[i*5+3],
-                    w[f'{bbb}ln1.weight'], w[f'{bbb}ln1.bias'],
-                    w[f'{att}time_mix_k'], w[f'{att}time_mix_v'], w[f'{att}time_mix_r'],
-                    w[f'{att}time_decay'], w[f'{att}time_first'],
-                    kw, vw, rw, ow,
-                    kmx, krx, kmy, kry,
-                    vmx, vrx, vmy, vry,
-                    rmx, rrx, rmy, rry,
-                    omx, orx, omy, ory,
-                    )
+                if self.version == 4:
+                    x, state[i*5+0], state[i*5+1], state[i*5+2], state[i*5+3] = ATT(
+                        x, state[i*5+0], state[i*5+1], state[i*5+2], state[i*5+3],
+                        w[f'{bbb}ln1.weight'], w[f'{bbb}ln1.bias'],
+                        w[f'{att}time_mix_k'], w[f'{att}time_mix_v'], w[f'{att}time_mix_r'],
+                        w[f'{att}time_decay'], w[f'{att}time_first'],
+                        kw, vw, rw, ow,
+                        kmx, krx, kmy, kry,
+                        vmx, vrx, vmy, vry,
+                        rmx, rrx, rmy, rry,
+                        omx, orx, omy, ory,
+                        )
+                elif self.version == 5:
+                    x, state[i*3+0], state[i*3+1] = ATT(
+                        x, state[i*3+0], state[i*3+1],
+                        w[f'{bbb}ln1.weight'], w[f'{bbb}ln1.bias'],
+                        w[f'{att}ln_x.weight'], w[f'{att}ln_x.bias'],
+                        w[f'{att}time_mix_k'], w[f'{att}time_mix_v'], w[f'{att}time_mix_r'],
+                        w[f'{att}time_decay'], w[f'{att}time_first'],
+                        kw, vw, rw, ow,
+                        kmx, krx, kmy, kry,
+                        vmx, vrx, vmy, vry,
+                        rmx, rrx, rmy, rry,
+                        omx, orx, omy, ory,
+                        )
                 if dd.stream:
                     del kw, vw, rw, ow
 
@@ -652,9 +800,13 @@ class RWKV(MyModule):
                 rmx = w[f'{ffn}receptance.weight_mx'] if wtype == torch.uint8 else x
                 rrx = w[f'{ffn}receptance.weight_rx'] if wtype == torch.uint8 else x
                 rmy = w[f'{ffn}receptance.weight_my'] if wtype == torch.uint8 else x
-                rry = w[f'{ffn}receptance.weight_ry'] if wtype == torch.uint8 else x                    
-                x, state[i*5+4] = FFN(
-                    x, state[i*5+4],
+                rry = w[f'{ffn}receptance.weight_ry'] if wtype == torch.uint8 else x
+                if self.version == 4:
+                    offset = i*5+4
+                elif self.version == 5:
+                    offset = i*3+2
+                x, state[offset] = FFN(
+                    x, state[offset],
                     w[f'{bbb}ln2.weight'], w[f'{bbb}ln2.bias'],
                     w[f'{ffn}time_mix_k'], w[f'{ffn}time_mix_r'],
                     kw, vw, rw,
