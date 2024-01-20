@@ -5,6 +5,7 @@
 from typing import Optional
 import types, gc, os, time, re
 import torch
+import torch.nn as nn
 from torch.nn import functional as F
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.allow_tf32 = True
@@ -32,7 +33,8 @@ if os.environ.get('RWKV_CUDA_ON') == '1':
             name=f"wkv_cuda",
             sources=[f"{current_path}/cuda/wrapper.cpp", f"{current_path}/cuda/operators.cu", f"{current_path}/cuda/gemm_fp16_cublas.cpp"],
             verbose=True,
-            extra_cuda_cflags=["-t 4", "-std=c++17", "--use_fast_math", "-O3", "--extra-device-vectorization"],
+            extra_ldflags=["cublas.lib" if os.name == "nt" else ""],
+            extra_cuda_cflags=["--use_fast_math", "-O3", "--extra-device-vectorization"],
             is_python_module=False)
         DISABLE_CUBLAS_GEMM = False
     except:
@@ -41,7 +43,7 @@ if os.environ.get('RWKV_CUDA_ON') == '1':
             name=f"wkv_cuda",
             sources=[f"{current_path}/cuda/wrapper.cpp", f"{current_path}/cuda/operators.cu"],
             verbose=True,
-            extra_cuda_cflags=["-t 4", "-std=c++17", "--use_fast_math", "-O3", "--extra-device-vectorization"],
+            extra_cuda_cflags=["--use_fast_math", "-O3", "--extra-device-vectorization"],
             extra_cflags=["-DDISABLE_CUBLAS_GEMM"],
             is_python_module=False)
         DISABLE_CUBLAS_GEMM = True
@@ -85,9 +87,61 @@ if os.environ.get('RWKV_CUDA_ON') == '1':
 else:
     os.environ["RWKV_CUDA_ON"] = '0'
 
-if os.environ.get('RWKV_CUDA_ON') == '1' and not DISABLE_CUBLAS_GEMM:
+
+@MyStatic
+def torch_mm8_seq(x, w, mx, rx, my, ry):
+    return x @ ((w.to(dtype=x.dtype) + 0.5) * ry * rx + my + mx)
+
+@MyStatic
+def torch_mm8_one(x, w, mx, rx, my, ry):
+    return x @ ((w.to(dtype=x.dtype) + 0.5) * ry * rx + my + mx)
+
+if os.environ.get('RWKV_CUDA_ON') == '1':
     @MyStatic
-    def gemm(a, b, output_dtype: Optional[torch.dtype]=None):
+    def mm8_seq(x, w, mx, rx, my, ry):
+        if w.device.type == 'cuda' and x.dtype == torch.float16:
+            B, N, M = x.shape[0], w.shape[0], w.shape[1]
+            return cuda_mm8_seq(B, N, M, x, w, mx, rx, my, ry)
+        else:
+            return torch_mm8_seq(x, w, mx, rx, my, ry)
+    @MyStatic
+    def mm8_one(x, w, mx, rx, my, ry):
+        if w.device.type == 'cuda':
+            N, M = w.shape[0], w.shape[1]
+            return cuda_mm8_one(N, M, x, w, mx, rx, my, ry)
+        else:
+            return torch_mm8_one(x, w, mx, rx, my, ry)
+else:
+    @MyStatic
+    def mm8_seq(x, w, mx, rx, my, ry):
+        return torch_mm8_seq(x, w, mx, rx, my, ry)
+    @MyStatic
+    def mm8_one(x, w, mx, rx, my, ry):
+        return torch_mm8_one(x, w, mx, rx, my, ry)
+
+def mm8(x: torch.Tensor, w: torch.Tensor, mx: torch.Tensor, rx: torch.Tensor, my: torch.Tensor, ry: torch.Tensor):
+    if len(x.shape) == 1:
+        return mm8_one(x, w, mx, rx, my, ry)
+    return mm8_seq(x, w, mx, rx, my, ry)
+
+def matmul(a, b, mx: Optional[torch.Tensor]=None, rx: Optional[torch.Tensor]=None, my: Optional[torch.Tensor]=None, ry: Optional[torch.Tensor]=None, output_dtype: Optional[torch.dtype]=None) -> torch.Tensor:
+    if output_dtype is None:
+        output_dtype = a.dtype
+    if b.dtype in [torch.float16, torch.bfloat16, torch.float32]:
+        assert a.dtype == b.dtype
+        return matmul_float(a, b, output_dtype=output_dtype)
+    elif b.dtype == torch.uint8:
+        assert mx is not None
+        assert rx is not None
+        assert my is not None
+        assert ry is not None
+        return mm8(a, b, mx, rx, my, ry).to(output_dtype)
+    else:
+        raise ValueError("Unsupported dtype")
+
+
+if os.environ.get('RWKV_CUDA_ON') == '1' and not DISABLE_CUBLAS_GEMM:
+    def matmul_float(a, b, output_dtype: Optional[torch.dtype]=None):
         if output_dtype is None:
             output_dtype = a.dtype
         if a.dtype == b.dtype == torch.float16 and a.device.type == 'cuda':
@@ -107,11 +161,15 @@ if os.environ.get('RWKV_CUDA_ON') == '1' and not DISABLE_CUBLAS_GEMM:
             return c
         else:
             return (a @ b).to(output_dtype)
+
 else:
-    def gemm(a, b, output_dtype: Optional[torch.dtype]=None):
-        if output_dtype is None:
-            output_dtype = a.dtype
+    def matmul_float(a, b, output_dtype: Optional[torch.dtype]=None):
         return (a @ b).to(output_dtype)
+
+
+if os.environ.get('RWKV_DML_ON') == '1':
+    import torch_directml
+    print("PyTorch with DirectML Enabled")
 
 ########################################################################################################
 
@@ -123,7 +181,7 @@ class RWKV(MyModule):
         else:
             prxxx = lambda *args, **kwargs: None
 
-        STRATEGY_REGEX = r"^(?:(?:^|->) *(?:cuda(?::[\d]+)?|cpu|mps) (?:fp(?:16|32)|bf16)(?:i8|i4|i3)?(?: \*[\d]+\+?)? *)+$"
+        STRATEGY_REGEX = r"^(?:(?:^|->) *(?:cuda(?::[\d]+)?|cpu|mps|dml) (?:fp(?:16|32)|bf16)(?:i8|i4|i3)?(?: \*[\d]+\+?)? *)+$"
         if not re.match(STRATEGY_REGEX, strategy):
             raise ValueError("Invalid strategy. Please read https://pypi.org/project/rwkv/")
 
@@ -134,7 +192,10 @@ class RWKV(MyModule):
         args.strategy_string = strategy
 
         # Rescale for fp16 mode: set x = x/2 every X layer (to avoid fp16 overflow)
-        self.RESCALE_LAYER = 6 if 'fp16' in strategy else 0
+        try:
+            self.RESCALE_LAYER = int(os.environ["RWKV_RESCALE_LAYER"]) # !!! NOTE: SEEMS YOU SHOULD SET IT TO 999 (disable) FOR RWKV-MUSIC MODELS !!!
+        except:
+            self.RESCALE_LAYER = 6 if 'fp16' in strategy else 0
         prxxx(f'RWKV_JIT_ON {os.environ["RWKV_JIT_ON"]} RWKV_CUDA_ON {os.environ["RWKV_CUDA_ON"]} RESCALE_LAYER {self.RESCALE_LAYER}\n')
 
         args.MODEL_NAME = args.MODEL_NAME.strip()
@@ -153,12 +214,14 @@ class RWKV(MyModule):
                 prxxx(f"Converted model: strategy {w['_strategy']}, version {w['_version']}\n")
                 assert w['_strategy'] == args.strategy_string # if you are using a new strategy, re-convert the model
                 assert float(w['_version']) >= 0.7 # sometimes you should re-convert using latest convert_model.py
-                assert w['_rescale_layer'] == self.RESCALE_LAYER
+                assert w['_rescale_layer'] == self.RESCALE_LAYER # must use same RESCALE_LAYER to avoid mistakes
                 del w['_strategy']
                 del w['_version']
                 del w['_rescale_layer']
             
             args.n_embd = w['emb.weight'].shape[1]
+            args.n_att = w['blocks.0.att.key.weight'].shape[0] # note: transposed matrix
+            args.n_ffn = w['blocks.0.ffn.key.weight'].shape[0] # note: transposed matrix
             args.n_layer = 0
             keys = list(w.keys())
             self.version = 4
@@ -166,9 +229,19 @@ class RWKV(MyModule):
                 layer_id = int(x.split('.')[1]) if ('blocks.' in x) else 0
                 args.n_layer = max(args.n_layer, layer_id+1)
                 if 'ln_x' in x:
-                    self.version = 5
-                if self.version == 5 and 'att.time_decay' in x:
+                    self.version = max(5, self.version)
+                if 'gate.weight' in x:
+                    self.version = max(5.1, self.version)
+                if int(self.version) == 5 and 'att.time_decay' in x:
                     args.n_head = w[x].shape[0]
+                    if len(w[x].shape) > 1:
+                        if w[x].shape[1] > 1:
+                            self.version = max(5.2, self.version)
+                if 'time_maa' in x:
+                    self.version = max(6, self.version)
+                if int(self.version) == 6 and 'time_faaaa' in x:
+                    args.n_head = w[x].shape[0]
+            prxxx(f'Model detected: v{self.version:.1f}')
 
             ####################### Compute strategy
 
@@ -232,6 +305,8 @@ class RWKV(MyModule):
                         strategy[n].atype = s[i][1][0]
                         strategy[n].wtype = s[i][1][1]
                         strategy[n].stream = False
+                        if strategy[n].device == 'dml':
+                            strategy[n].device = torch_directml.device()
                         if i == stream_i and n >= (plan[i] - stream_count):
                             strategy[n].stream = True
                         break
@@ -249,6 +324,14 @@ class RWKV(MyModule):
                 del w['blocks.0.ln0.bias']
 
             print_need_newline = False
+
+            REAL_TIME_FIRST = False
+            for x in list(w.keys()):
+                if '.time_faaaa' in x: REAL_TIME_FIRST = True
+            if REAL_TIME_FIRST:
+                w = {k.replace('.time_faaaa','.time_first') if '.time_faaaa' in k else k: v for k, v in w.items()}
+                self.w = w
+            
             keys = list(w.keys())
             for x in keys:
                 w[x].requires_grad = False
@@ -269,19 +352,28 @@ class RWKV(MyModule):
 
                     if '.time_' in x:
                         w[x] = w[x].squeeze()
-                    if 'key.weight' in x or 'value.weight' in x or 'receptance.weight' in x or 'output.weight' in x or 'head.weight' in x:
+                    if 'key.weight' in x or 'value.weight' in x or 'receptance.weight' in x or 'gate.weight' in x or 'output.weight' in x or 'head.weight' in x:
                         w[x] = w[x].t()
 
-                    if '.time_decay' in x: # need fp32 for this
+                    if '.time_decay' in x and '_w' not in x: # need fp32 for this
                         if self.version == 4:
                             w[x] = -torch.exp(w[x].float())
-                        elif self.version == 5:
+                        elif int(self.version) == 5:
                             w[x] = torch.exp(-torch.exp(w[x].float())).reshape(-1,1,1)
+                            if self.version == 5.2:
+                                w[x] = w[x].reshape(args.n_head, -1, 1)
+                        elif self.version == 6.0:
+                            w[x] = w[x].float().reshape(args.n_head, -1, 1)
                     elif '.time_first' in x: # need fp32 for this
                         if self.version == 4:
                             w[x] = w[x].float()
-                        elif self.version == 5:
-                            w[x] = torch.exp(w[x].float()).reshape(-1,1,1)
+                        elif int(self.version) in [5, 6]:
+                            if REAL_TIME_FIRST:
+                                w[x] = w[x].float().reshape(-1,1,1)
+                            else:
+                                w[x] = torch.exp(w[x].float()).reshape(-1,1,1)
+                            if self.version in [5.2, 6.0]:
+                                w[x] = w[x].reshape(args.n_head, -1, 1)
                     elif '.ln_x' in x: # need fp32 for group_norm
                         w[x] = w[x].float()
                     else:
@@ -370,40 +462,81 @@ class RWKV(MyModule):
                 prxxx(f'Converted and saved. Now this will exit.')
                 exit(0)
             
+            if self.version == 5.2 and os.environ["RWKV_CUDA_ON"] == '1':
+                HEAD_SIZE = args.n_att // args.n_head
+                rwkv5 = load(name="rwkv5", sources=[f"{current_path}/cuda/rwkv5_op.cpp", f"{current_path}/cuda/rwkv5.cu"],
+                                verbose=True, extra_cuda_cflags=["-res-usage", "--use_fast_math", "-O3", "-Xptxas -O3" if os.name != "nt" else "", "--extra-device-vectorization", f"-D_N_={HEAD_SIZE}"])
+
+                class RWKV_5(torch.autograd.Function):
+                    @staticmethod
+                    def forward(ctx, B, T, C, H, state, r, k, v, w, u):
+                        with torch.no_grad():
+                            assert HEAD_SIZE == C // H
+                            ctx.B = B
+                            ctx.T = T
+                            ctx.C = C
+                            ctx.H = H
+                            assert state.dtype == torch.float32
+                            assert w.dtype == torch.float32
+                            assert r.is_contiguous()
+                            assert k.is_contiguous()
+                            assert v.is_contiguous()
+                            assert w.is_contiguous()                            
+                            assert u.is_contiguous()                            
+                            assert state.is_contiguous()
+
+                            y = torch.empty((B, T, C), device=w.device, dtype=r.dtype, memory_format=torch.contiguous_format)
+                            if r.dtype == torch.bfloat16:
+                                rwkv5.forward_bf16(B, T, C, H, state, r, k, v, w, u, y)
+                            elif r.dtype == torch.float16:
+                                rwkv5.forward_fp16(B, T, C, H, state, r, k, v, w, u, y)
+                            elif r.dtype == torch.float32:
+                                rwkv5.forward_fp32(B, T, C, H, state, r, k, v, w, u, y)
+                            return y, state
+                self.RWKV_5 = RWKV_5
+
+            if self.version == 6.0 and os.environ["RWKV_CUDA_ON"] == '1':
+                HEAD_SIZE = args.n_att // args.n_head
+                rwkv6 = load(name="rwkv6", sources=[f"{current_path}/cuda/rwkv6_op.cpp", f"{current_path}/cuda/rwkv6.cu"],
+                                verbose=True, extra_cuda_cflags=["-res-usage", "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization", f"-D_N_={HEAD_SIZE}", f"-D_T_={4096}"])
+                    
+                class RWKV_6(torch.autograd.Function):
+                    @staticmethod
+                    def forward(ctx, B, T, C, H, state, r, k, v, w, u):
+                        with torch.no_grad():
+                            assert HEAD_SIZE == C // H
+                            ctx.B = B
+                            ctx.T = T
+                            ctx.C = C
+                            ctx.H = H
+                            assert state.dtype == torch.float32
+                            assert w.dtype == torch.float32
+                            assert r.is_contiguous()
+                            assert k.is_contiguous()
+                            assert v.is_contiguous()
+                            assert w.is_contiguous()
+                            assert u.is_contiguous()
+                            eew = torch.exp(-torch.exp(w.float())).contiguous()
+
+                            y = torch.empty((B, T, C), device=w.device, dtype=r.dtype, memory_format=torch.contiguous_format)
+                            if r.dtype == torch.bfloat16:
+                                rwkv6.forward_bf16(B, T, C, H, state, r, k, v, eew, u, y)
+                            elif r.dtype == torch.float16:
+                                rwkv6.forward_fp16(B, T, C, H, state, r, k, v, eew, u, y)
+                            elif r.dtype == torch.float32:
+                                rwkv6.forward_fp32(B, T, C, H, state, r, k, v, eew, u, y)
+                            return y, state
+                self.RWKV_6 = RWKV_6
+        
             gc.collect()
             if 'cuda' in args.strategy_string:
                 torch.cuda.empty_cache()
 
-    @MyFunction
-    def torch_mm8_seq(self, x, w, mx, rx, my, ry):
-        return x @ ((w.to(dtype=x.dtype) + 0.5) * ry * rx + my + mx)
+    def RUN_RWKV_5(self, B, T, C, H, state, r, k, v, w, u):
+        return self.RWKV_5.apply(B, T, C, H, state, r, k, v, w, u)
 
-    @MyFunction
-    def torch_mm8_one(self, x, w, mx, rx, my, ry):
-        return x @ ((w.to(dtype=x.dtype) + 0.5) * ry * rx + my + mx)
-
-    if os.environ.get('RWKV_CUDA_ON') == '1':
-        @MyFunction
-        def mm8_seq(self, x, w, mx, rx, my, ry):
-            if w.device.type == 'cuda' and x.dtype == torch.float16:
-                B, N, M = x.shape[0], w.shape[0], w.shape[1]
-                return cuda_mm8_seq(B, N, M, x, w, mx, rx, my, ry)
-            else:
-                return self.torch_mm8_seq(x, w, mx, rx, my, ry)
-        @MyFunction
-        def mm8_one(self, x, w, mx, rx, my, ry):
-            if w.device.type == 'cuda':
-                N, M = w.shape[0], w.shape[1]
-                return cuda_mm8_one(N, M, x, w, mx, rx, my, ry)
-            else:
-                return self.torch_mm8_one(x, w, mx, rx, my, ry)
-    else:
-        @MyFunction
-        def mm8_seq(self, x, w, mx, rx, my, ry):
-            return self.torch_mm8_seq(x, w, mx, rx, my, ry)
-        @MyFunction
-        def mm8_one(self, x, w, mx, rx, my, ry):
-            return self.torch_mm8_one(x, w, mx, rx, my, ry)
+    def RUN_RWKV_6(self, B, T, C, H, state, r, k, v, w, u):
+        return self.RWKV_6.apply(B, T, C, H, state, r, k, v, w, u)
 
     ########################################################################################################
 
@@ -413,23 +546,10 @@ class RWKV(MyModule):
         kx = xx * k_mix + sx * (1 - k_mix)
         rx = xx * r_mix + sx * (1 - r_mix)
 
-        r = torch.sigmoid(gemm(rx, rw))
-        vx = torch.square(torch.relu(gemm(kx, kw)))
-        out = r * gemm(vx, vw)
+        r = torch.sigmoid(matmul(rx, rw, rmx, rrx, rmy, rry))
+        vx = torch.relu(matmul(kx, kw, kmx, krx, kmy, kry)) ** 2
+        out = r * matmul(vx, vw, vmx, vrx, vmy, vry)
         return x + out, xx
-
-    @MyFunction
-    def ffn_one_i8(self, x, sx, ln_w, ln_b, k_mix, r_mix, kw, vw, rw, kmx, krx, kmy, kry, vmx, vrx, vmy, vry, rmx, rrx, rmy, rry):
-        xx = F.layer_norm(x, (x.shape[-1],), weight=ln_w, bias=ln_b)
-        kx = xx * k_mix + sx * (1 - k_mix)
-        rx = xx * r_mix + sx * (1 - r_mix)
-
-        r = torch.sigmoid(self.mm8_one(rx, rw, rmx, rrx, rmy, rry))
-        vx = torch.square(torch.relu(self.mm8_one(kx, kw, kmx, krx, kmy, kry)))
-        out = r * (self.mm8_one(vx, vw, vmx, vrx, vmy, vry))
-        return x + out, xx
-    
-    ########################################################################################################
 
     @MyFunction
     def ffn_seq(self, x, sx, ln_w, ln_b, k_mix, r_mix, kw, vw, rw, kmx, krx, kmy, kry, vmx, vrx, vmy, vry, rmx, rrx, rmy, rry):
@@ -438,21 +558,34 @@ class RWKV(MyModule):
         kx = xx * k_mix + sx * (1 - k_mix)
         rx = xx * r_mix + sx * (1 - r_mix)
 
-        r = torch.sigmoid(gemm(rx, rw))
-        vx = torch.square(torch.relu(gemm(kx, kw)))
-        out = r * gemm(vx, vw)
+        r = torch.sigmoid(matmul(rx, rw, rmx, rrx, rmy, rry))
+        vx = torch.relu(matmul(kx, kw, kmx, krx, kmy, kry)) ** 2
+        out = r * matmul(vx, vw, vmx, vrx, vmy, vry)
         return x + out, xx[-1,:]
 
     @MyFunction
-    def ffn_seq_i8(self, x, sx, ln_w, ln_b, k_mix, r_mix, kw, vw, rw, kmx, krx, kmy, kry, vmx, vrx, vmy, vry, rmx, rrx, rmy, rry):
+    def ffn_one_v6(self, x, sx, ln_w, ln_b, k_maa, r_maa, kw, vw, rw, kmx, krx, kmy, kry, vmx, vrx, vmy, vry, rmx, rrx, rmy, rry):
+        xx = F.layer_norm(x, (x.shape[-1],), weight=ln_w, bias=ln_b)
+        sx = sx - xx
+        kx = xx + sx * k_maa
+        rx = xx + sx * r_maa
+
+        r = torch.sigmoid(matmul(rx, rw, rmx, rrx, rmy, rry))
+        vx = torch.relu(matmul(kx, kw, kmx, krx, kmy, kry)) ** 2
+        out = r * matmul(vx, vw, vmx, vrx, vmy, vry)
+        return x + out, xx
+
+    @MyFunction
+    def ffn_seq_v6(self, x, sx, ln_w, ln_b, k_maa, r_maa, kw, vw, rw, kmx, krx, kmy, kry, vmx, vrx, vmy, vry, rmx, rrx, rmy, rry):
         xx = F.layer_norm(x, (x.shape[-1],), weight=ln_w, bias=ln_b)
         sx = torch.cat((sx.unsqueeze(0), xx[:-1,:]))
-        kx = xx * k_mix + sx * (1 - k_mix)
-        rx = xx * r_mix + sx * (1 - r_mix)
+        sx = sx - xx
+        kx = xx + sx * k_maa
+        rx = xx + sx * r_maa
 
-        r = torch.sigmoid(self.mm8_seq(rx, rw, rmx, rrx, rmy, rry))
-        vx = torch.square(torch.relu(self.mm8_seq(kx, kw, kmx, krx, kmy, kry)))
-        out = r * (self.mm8_seq(vx, vw, vmx, vrx, vmy, vry))
+        r = torch.sigmoid(matmul(rx, rw, rmx, rrx, rmy, rry))
+        vx = torch.relu(matmul(kx, kw, kmx, krx, kmy, kry)) ** 2
+        out = r * matmul(vx, vw, vmx, vrx, vmy, vry)
         return x + out, xx[-1,:]
 
     ########################################################################################################
@@ -464,9 +597,9 @@ class RWKV(MyModule):
         vx = xx * v_mix + sx * (1 - v_mix)
         rx = xx * r_mix + sx * (1 - r_mix)
 
-        r = torch.sigmoid(gemm(rx, rw))
-        k = gemm(kx, kw, output_dtype=torch.float32)
-        v = gemm(vx, vw, output_dtype=torch.float32)
+        r = torch.sigmoid(matmul(rx, rw, rmx, rrx, rmy, rry))
+        k = matmul(kx, kw, kmx, krx, kmy, kry, output_dtype=torch.float32)
+        v = matmul(vx, vw, vmx, vrx, vmy, vry, output_dtype=torch.float32)
 
         ww = t_first + k
         p = torch.maximum(pp, ww)
@@ -478,34 +611,8 @@ class RWKV(MyModule):
         e1 = torch.exp(ww - p)
         e2 = torch.exp(k - p)
 
-        out = gemm(r * wkv, ow)
+        out = matmul(r * wkv, ow, omx, orx, omy, ory)
         return x + out, xx, e1 * aa + e2 * v, e1 * bb + e2, p
-
-    @MyFunction
-    def att_one_i8(self, x, sx, aa, bb, pp, ln_w, ln_b, k_mix, v_mix, r_mix, t_decay, t_first, kw, vw, rw, ow, kmx, krx, kmy, kry, vmx, vrx, vmy, vry, rmx, rrx, rmy, rry, omx, orx, omy, ory):
-        xx = F.layer_norm(x, (x.shape[-1],), weight=ln_w, bias=ln_b)
-        kx = xx * k_mix + sx * (1 - k_mix)
-        vx = xx * v_mix + sx * (1 - v_mix)
-        rx = xx * r_mix + sx * (1 - r_mix)
-
-        r = torch.sigmoid(self.mm8_one(rx, rw, rmx, rrx, rmy, rry))
-        k = (self.mm8_one(kx, kw, kmx, krx, kmy, kry)).float()
-        v = (self.mm8_one(vx, vw, vmx, vrx, vmy, vry)).float()
-
-        ww = t_first + k
-        p = torch.maximum(pp, ww)
-        e1 = torch.exp(pp - p)
-        e2 = torch.exp(ww - p)
-        wkv = ((e1 * aa + e2 * v) / (e1 * bb + e2)).to(dtype=x.dtype)
-        ww = t_decay + pp
-        p = torch.maximum(ww, k)
-        e1 = torch.exp(ww - p)
-        e2 = torch.exp(k - p)
-
-        out = self.mm8_one(r * wkv, ow, omx, orx, omy, ory)
-        return x + out, xx, e1 * aa + e2 * v, e1 * bb + e2, p
-
-    ########################################################################################################
 
     @MyFunction
     def att_seq(self, x, sx, aa, bb, pp, ln_w, ln_b, k_mix, v_mix, r_mix, t_decay, t_first, kw, vw, rw, ow, kmx, krx, kmy, kry, vmx, vrx, vmy, vry, rmx, rrx, rmy, rry, omx, orx, omy, ory):
@@ -515,9 +622,9 @@ class RWKV(MyModule):
         vx = xx * v_mix + sx * (1 - v_mix)
         rx = xx * r_mix + sx * (1 - r_mix)
 
-        r = torch.sigmoid(gemm(rx, rw))
-        k = gemm(kx, kw, output_dtype=torch.float32)
-        v = gemm(vx, vw, output_dtype=torch.float32)
+        r = torch.sigmoid(matmul(rx, rw, rmx, rrx, rmy, rry))
+        k = matmul(kx, kw, kmx, krx, kmy, kry, output_dtype=torch.float32)
+        v = matmul(vx, vw, vmx, vrx, vmy, vry, output_dtype=torch.float32)
 
         T = x.shape[0]
         for t in range(T):
@@ -535,38 +642,7 @@ class RWKV(MyModule):
             aa = e1 * aa + e2 * vv
             bb = e1 * bb + e2
             pp = p
-        out = gemm(r * sx, ow)
-        return x + out, xx[-1,:], aa, bb, pp
-
-    @MyFunction
-    def att_seq_i8(self, x, sx, aa, bb, pp, ln_w, ln_b, k_mix, v_mix, r_mix, t_decay, t_first, kw, vw, rw, ow, kmx, krx, kmy, kry, vmx, vrx, vmy, vry, rmx, rrx, rmy, rry, omx, orx, omy, ory):
-        xx = F.layer_norm(x, (x.shape[-1],), weight=ln_w, bias=ln_b)
-        sx = torch.cat((sx.unsqueeze(0), xx[:-1,:]))
-        kx = xx * k_mix + sx * (1 - k_mix)
-        vx = xx * v_mix + sx * (1 - v_mix)
-        rx = xx * r_mix + sx * (1 - r_mix)
-
-        r = torch.sigmoid(self.mm8_seq(rx, rw, rmx, rrx, rmy, rry))
-        k = self.mm8_seq(kx, kw, kmx, krx, kmy, kry).float()
-        v = self.mm8_seq(vx, vw, vmx, vrx, vmy, vry).float()
-
-        T = x.shape[0]
-        for t in range(T):
-            kk = k[t]
-            vv = v[t]
-            ww = t_first + kk
-            p = torch.maximum(pp, ww)
-            e1 = torch.exp(pp - p)
-            e2 = torch.exp(ww - p)
-            sx[t] = ((e1 * aa + e2 * vv) / (e1 * bb + e2)).to(dtype=x.dtype)
-            ww = t_decay + pp
-            p = torch.maximum(ww, kk)
-            e1 = torch.exp(ww - p)
-            e2 = torch.exp(kk - p)
-            aa = e1 * aa + e2 * vv
-            bb = e1 * bb + e2
-            pp = p
-        out = self.mm8_seq(r * sx, ow, omx, orx, omy, ory)
+        out = matmul(r * sx, ow, omx, orx, omy, ory)
         return x + out, xx[-1,:], aa, bb, pp
 
     ########################################################################################################
@@ -579,20 +655,20 @@ class RWKV(MyModule):
         rx = xx * r_mix + sx * (1 - r_mix)
 
         H = t_decay.shape[0]
-        S = x.shape[-1] // H
+        N = x.shape[-1] // H
 
-        r = gemm(rx, rw, output_dtype=torch.float32).view(H, 1, S)
-        k = gemm(kx, kw, output_dtype=torch.float32).view(H, S, 1)
-        v = gemm(vx, vw, output_dtype=torch.float32).view(H, 1, S)
+        r = matmul(rx, rw, rmx, rrx, rmy, rry, output_dtype=torch.float32).view(H, 1, N)
+        k = matmul(kx, kw, kmx, krx, kmy, kry, output_dtype=torch.float32).view(H, N, 1)
+        v = matmul(vx, vw, vmx, vrx, vmy, vry, output_dtype=torch.float32).view(H, 1, N)
         
-        a = gemm(k, v)
+        a = matmul(k, v)
         out = r @ (t_first * a + s)
         s = a + t_decay * s
 
         out = out.flatten()
-        out = F.group_norm(out.unsqueeze(0), num_groups=H, weight=lx_w, bias=lx_b).squeeze(0)
+        out = F.group_norm(out.unsqueeze(0), num_groups=H, weight=lx_w, bias=lx_b, eps = 64e-5).squeeze(0)
         out = out.to(dtype=x.dtype)
-        out = gemm(out, ow)
+        out = matmul(out, ow, omx, orx, omy, ory)
 
         return x + out, xx, s
 
@@ -605,7 +681,7 @@ class RWKV(MyModule):
         rx = xx * r_mix + sx * (1 - r_mix)
 
         H = t_decay.shape[0]
-        S = x.shape[-1] // H
+        N = x.shape[-1] // H
         T = x.shape[0]
 
         w = t_decay.reshape(-1, 1)
@@ -621,17 +697,205 @@ class RWKV(MyModule):
         w = w[:, :-T].reshape(-1, T, 2 * T - 1)
         w = w[:, :, T-1:].reshape(H, T, T)
 
-        r = gemm(rx, rw, output_dtype=torch.float32).view(T, H, S).transpose(0, 1)
-        k = gemm(kx, kw, output_dtype=torch.float32).view(T, H, S).transpose(0, 1).transpose(-2, -1)
-        v = gemm(vx, vw, output_dtype=torch.float32).view(T, H, S).transpose(0, 1)
+        r = matmul(rx, rw, rmx, rrx, rmy, rry, output_dtype=torch.float32).view(T, H, N).transpose(0, 1)
+        k = matmul(kx, kw, kmx, krx, kmy, kry, output_dtype=torch.float32).view(T, H, N).permute(1, 2, 0)
+        v = matmul(vx, vw, vmx, vrx, vmy, vry, output_dtype=torch.float32).view(T, H, N).transpose(0, 1)
 
         out = ((r @ k) * w) @ v + (r @ s) * wb
         s = ws * s + (k * wk) @ v
         
-        out = out.transpose(0, 1).contiguous().reshape(T, H*S)
-        out = F.group_norm(out, num_groups=H, weight=lx_w, bias=lx_b)
+        out = out.transpose(0, 1).contiguous().reshape(T, H*N)
+        out = F.group_norm(out, num_groups=H, weight=lx_w, bias=lx_b, eps = 64e-5)
         out = out.to(dtype=x.dtype)
-        out = gemm(out, ow)
+        out = matmul(out, ow, omx, orx, omy, ory)
+
+        return x + out, xx[-1,:], s
+
+    ########################################################################################################
+
+    @MyFunction
+    def att_one_v5_1(self, x, sx, s, ln_w, ln_b, lx_w, lx_b, k_mix, v_mix, r_mix, g_mix, t_decay, t_first, kw, vw, rw, gw, ow, kmx, krx, kmy, kry, vmx, vrx, vmy, vry, rmx, rrx, rmy, rry, gmx, grx, gmy, gry, omx, orx, omy, ory):
+        xx = F.layer_norm(x, (x.shape[-1],), weight=ln_w, bias=ln_b)
+        kx = xx * k_mix + sx * (1 - k_mix)
+        vx = xx * v_mix + sx * (1 - v_mix)
+        rx = xx * r_mix + sx * (1 - r_mix)
+        gx = xx * g_mix + sx * (1 - g_mix)
+
+        H = t_decay.shape[0]
+        N = x.shape[-1] // H
+
+        r = matmul(rx, rw, rmx, rrx, rmy, rry, output_dtype=torch.float32).view(H, 1, N)
+        k = matmul(kx, kw, kmx, krx, kmy, kry, output_dtype=torch.float32).view(H, N, 1)
+        v = matmul(vx, vw, vmx, vrx, vmy, vry, output_dtype=torch.float32).view(H, 1, N)
+        g = F.silu(matmul(gx, gw, gmx, grx, gmy, gry))
+        
+        a = matmul(k, v)
+        out = r @ (t_first * a + s)
+        s = a + t_decay * s
+
+        out = out.flatten()
+        out = F.group_norm(out.unsqueeze(0), num_groups=H, weight=lx_w, bias=lx_b, eps = 64e-5).squeeze(0)
+        out = out.to(dtype=x.dtype) * g
+        out = matmul(out, ow, omx, orx, omy, ory)
+
+        return x + out, xx, s
+
+    @MyFunction
+    def att_seq_v5_1(self, x, sx, s, ln_w, ln_b, lx_w, lx_b, k_mix, v_mix, r_mix, g_mix, t_decay, t_first, kw, vw, rw, gw, ow, kmx, krx, kmy, kry, vmx, vrx, vmy, vry, rmx, rrx, rmy, rry, gmx, grx, gmy, gry, omx, orx, omy, ory):
+        xx = F.layer_norm(x, (x.shape[-1],), weight=ln_w, bias=ln_b)
+        sx = torch.cat((sx.unsqueeze(0), xx[:-1,:]))
+        kx = xx * k_mix + sx * (1 - k_mix)
+        vx = xx * v_mix + sx * (1 - v_mix)
+        rx = xx * r_mix + sx * (1 - r_mix)
+        gx = xx * g_mix + sx * (1 - g_mix)
+
+        H = t_decay.shape[0]
+        N = x.shape[-1] // H
+        T = x.shape[0]
+
+        w = t_decay.reshape(-1, 1)
+        u = t_first.reshape(-1, 1)
+        ws = w.pow(T).reshape(H, 1, 1)
+        ind = torch.arange(T-1, -1, -1, device=w.device).unsqueeze(0).repeat(H, 1)
+        w = w.repeat(1, T).pow(ind)
+        wk = w.reshape(H, 1, T)
+        wb = wk.transpose(-2, -1).flip(1)
+        w = torch.cat([w[:, 1:], u], dim=1)
+        w = F.pad(w, (0, T))
+        w = torch.tile(w, [T])
+        w = w[:, :-T].reshape(-1, T, 2 * T - 1)
+        w = w[:, :, T-1:].reshape(H, T, T)
+
+        r = matmul(rx, rw, rmx, rrx, rmy, rry, output_dtype=torch.float32).view(T, H, N).transpose(0, 1)
+        k = matmul(kx, kw, kmx, krx, kmy, kry, output_dtype=torch.float32).view(T, H, N).permute(1, 2, 0)
+        v = matmul(vx, vw, vmx, vrx, vmy, vry, output_dtype=torch.float32).view(T, H, N).transpose(0, 1)
+        g = F.silu(matmul(gx, gw, gmx, grx, gmy, gry))
+
+        out = ((r @ k) * w) @ v + (r @ s) * wb
+        s = ws * s + (k * wk) @ v
+        
+        out = out.transpose(0, 1).contiguous().reshape(T, H*N)
+        out = F.group_norm(out, num_groups=H, weight=lx_w, bias=lx_b, eps = 64e-5)
+        out = out.to(dtype=x.dtype) * g
+        out = matmul(out, ow, omx, orx, omy, ory)
+
+        return x + out, xx[-1,:], s
+
+    ########################################################################################################
+
+    @MyFunction
+    def att_seq_v5_2(self, x, sx, s, ln_w, ln_b, lx_w, lx_b, k_mix, v_mix, r_mix, g_mix, t_decay, t_first, kw, vw, rw, gw, ow, kmx, krx, kmy, kry, vmx, vrx, vmy, vry, rmx, rrx, rmy, rry, gmx, grx, gmy, gry, omx, orx, omy, ory):
+        xx = F.layer_norm(x, (x.shape[-1],), weight=ln_w, bias=ln_b)
+        sx = torch.cat((sx.unsqueeze(0), xx[:-1,:]))
+        kx = xx * k_mix + sx * (1 - k_mix)
+        vx = xx * v_mix + sx * (1 - v_mix)
+        rx = xx * r_mix + sx * (1 - r_mix)
+        gx = xx * g_mix + sx * (1 - g_mix)
+
+        H = t_decay.shape[0]
+        N = x.shape[-1] // H
+        T = x.shape[0]
+
+        r = matmul(rx, rw, rmx, rrx, rmy, rry, output_dtype=torch.float32).view(T, H, N).transpose(0, 1)
+        k = matmul(kx, kw, kmx, krx, kmy, kry, output_dtype=torch.float32).view(T, H, N).permute(1, 2, 0)
+        v = matmul(vx, vw, vmx, vrx, vmy, vry, output_dtype=torch.float32).view(T, H, N).transpose(0, 1)
+        g = F.silu(matmul(gx, gw, gmx, grx, gmy, gry))
+
+        out = torch.empty((T, H, N), dtype=r.dtype, device=r.device)
+        for t in range(T):
+            rt = r[:,t:t+1,:]
+            kt = k[:,:,t:t+1]
+            vt = v[:,t:t+1,:]
+            at = matmul(kt, vt)
+            out[t] = (rt @ (t_first * at + s)).squeeze(1)
+            s = at + t_decay * s
+
+        out = out.reshape(T, H*N)
+        out = F.group_norm(out, num_groups=H, weight=lx_w, bias=lx_b, eps = 64e-5)
+        out = out.to(dtype=x.dtype) * g
+        out = matmul(out, ow, omx, orx, omy, ory)
+
+        return x + out, xx[-1,:], s
+
+    ########################################################################################################
+
+    @MyFunction
+    def att_one_v6_0(self, x, sx, s, ln_w, ln_b, lx_w, lx_b, x_maa, w_maa, k_maa, v_maa, r_maa, g_maa, tm_w1, tm_w2, td_w1, td_w2, t_decay, t_first, kw, vw, rw, gw, ow, kmx, krx, kmy, kry, vmx, vrx, vmy, vry, rmx, rrx, rmy, rry, gmx, grx, gmy, gry, omx, orx, omy, ory):
+        xx = F.layer_norm(x, (x.shape[-1],), weight=ln_w, bias=ln_b)
+        
+        sx = sx - xx
+        xxx = xx + sx * x_maa
+        xxx = torch.tanh(xxx @ tm_w1).view(5, 1, -1)
+        xxx = torch.bmm(xxx, tm_w2).view(5, -1)
+        mw, mk, mv, mr, mg = xxx.unbind(dim=0)
+
+        wx = xx + sx * (w_maa + mw)
+        kx = xx + sx * (k_maa + mk)
+        vx = xx + sx * (v_maa + mv)
+        rx = xx + sx * (r_maa + mr)
+        gx = xx + sx * (g_maa + mg)
+
+        H = t_decay.shape[0]
+        N = x.shape[-1] // H
+
+        r = matmul(rx, rw, rmx, rrx, rmy, rry, output_dtype=torch.float32).view(H, 1, N)
+        k = matmul(kx, kw, kmx, krx, kmy, kry, output_dtype=torch.float32).view(H, N, 1)
+        v = matmul(vx, vw, vmx, vrx, vmy, vry, output_dtype=torch.float32).view(H, 1, N)
+        g = F.silu(matmul(gx, gw, gmx, grx, gmy, gry))
+        
+        w = t_decay + (torch.tanh(wx @ td_w1) @ td_w2).float().view(H, N, 1)
+        w = torch.exp(-torch.exp(w.float()))
+
+        a = matmul(k, v)
+        out = r @ (t_first * a + s)
+        s = a + w * s
+
+        out = out.flatten()
+        out = F.group_norm(out.unsqueeze(0), num_groups=H, weight=lx_w, bias=lx_b, eps = 64e-5).squeeze(0)
+        out = out.to(dtype=x.dtype) * g
+        out = matmul(out, ow, omx, orx, omy, ory)
+
+        return x + out, xx, s
+
+    @MyFunction
+    def att_seq_v6_0(self, x, sx, s, ln_w, ln_b, lx_w, lx_b, x_maa, w_maa, k_maa, v_maa, r_maa, g_maa, tm_w1, tm_w2, td_w1, td_w2, t_decay, t_first, kw, vw, rw, gw, ow, kmx, krx, kmy, kry, vmx, vrx, vmy, vry, rmx, rrx, rmy, rry, gmx, grx, gmy, gry, omx, orx, omy, ory):
+        H = t_decay.shape[0]
+        N = x.shape[-1] // H
+        T = x.shape[0]
+
+        xx = F.layer_norm(x, (x.shape[-1],), weight=ln_w, bias=ln_b)
+        sx = torch.cat((sx.unsqueeze(0), xx[:-1,:])) - xx
+        xxx = xx + sx * x_maa
+        xxx = torch.tanh(xxx @ tm_w1).view(T, 5, -1).transpose(0, 1)
+        xxx = torch.bmm(xxx, tm_w2).view(5, T, -1)
+        mw, mk, mv, mr, mg = xxx.unbind(dim=0)
+
+        wx = xx + sx * (w_maa + mw)
+        kx = xx + sx * (k_maa + mk)
+        vx = xx + sx * (v_maa + mv)
+        rx = xx + sx * (r_maa + mr)
+        gx = xx + sx * (g_maa + mg)
+
+        r = matmul(rx, rw, rmx, rrx, rmy, rry, output_dtype=torch.float32).view(T, H, N).transpose(0, 1)
+        k = matmul(kx, kw, kmx, krx, kmy, kry, output_dtype=torch.float32).view(T, H, N).permute(1, 2, 0)
+        v = matmul(vx, vw, vmx, vrx, vmy, vry, output_dtype=torch.float32).view(T, H, N).transpose(0, 1)
+        g = F.silu(matmul(gx, gw, gmx, grx, gmy, gry))
+
+        w = t_decay.view(1, H, N, 1) + (torch.tanh(wx @ td_w1) @ td_w2).float().view(T, H, N, 1)
+        w = torch.exp(-torch.exp(w.float()))
+        out = torch.empty((T, H, N), dtype=r.dtype, device=r.device)
+        for t in range(T):
+            rt = r[:,t:t+1,:]
+            kt = k[:,:,t:t+1]
+            vt = v[:,t:t+1,:]
+            at = matmul(kt, vt)
+            out[t] = (rt @ (t_first * at + s)).squeeze(1)
+            s = at + w[t] * s
+
+        out = out.reshape(T, H*N)
+        out = F.group_norm(out, num_groups=H, weight=lx_w, bias=lx_b, eps = 64e-5)
+        out = out.to(dtype=x.dtype) * g
+        out = matmul(out, ow, omx, orx, omy, ory)
 
         return x + out, xx[-1,:], s
 
@@ -640,37 +904,99 @@ class RWKV(MyModule):
     if os.environ["RWKV_CUDA_ON"] == '1':
         @MyFunction
         def cuda_att_seq(self, x, sx, aa, bb, pp, ln_w, ln_b, k_mix, v_mix, r_mix, t_decay, t_first, kw, vw, rw, ow, kmx, krx, kmy, kry, vmx, vrx, vmy, vry, rmx, rrx, rmy, rry, omx, orx, omy, ory):
-            T, C = x.size()
+            T, C = x.shape
             xx = F.layer_norm(x, (C,), weight=ln_w, bias=ln_b)
             sx = torch.cat((sx.unsqueeze(0), xx[:-1,:]))
             kx = xx * k_mix + sx * (1 - k_mix)
             vx = xx * v_mix + sx * (1 - v_mix)
             rx = xx * r_mix + sx * (1 - r_mix)
 
-            r = torch.sigmoid(gemm(rx, rw))
-            k = gemm(kx, kw, output_dtype=torch.float32)
-            v = gemm(vx, vw, output_dtype=torch.float32)
+            r = torch.sigmoid(matmul(rx, rw, rmx, rrx, rmy, rry))
+            k = matmul(kx, kw, kmx, krx, kmy, kry, output_dtype=torch.float32)
+            v = matmul(vx, vw, vmx, vrx, vmy, vry, output_dtype=torch.float32)
             y, aa, bb, pp = cuda_wkv(T, C, t_decay, t_first, k, v, aa, bb, pp)
-            
-            out = gemm(r * y.to(x.dtype), ow)
+
+            out = matmul(r * y.to(x.dtype), ow, omx, orx, omy, ory)
             return x + out, xx[-1,:], aa, bb, pp
 
         @MyFunction
-        def cuda_att_seq_i8(self, x, sx, aa, bb, pp, ln_w, ln_b, k_mix, v_mix, r_mix, t_decay, t_first, kw, vw, rw, ow, kmx, krx, kmy, kry, vmx, vrx, vmy, vry, rmx, rrx, rmy, rry, omx, orx, omy, ory):
-            T, C = x.size()
-            xx = F.layer_norm(x, (C,), weight=ln_w, bias=ln_b)
+        def v5_2_before(self, x, sx, s, ln_w, ln_b, lx_w, lx_b, k_mix, v_mix, r_mix, g_mix, t_decay, t_first, kw, vw, rw, gw, ow, kmx, krx, kmy, kry, vmx, vrx, vmy, vry, rmx, rrx, rmy, rry, gmx, grx, gmy, gry, omx, orx, omy, ory):
+            xx = F.layer_norm(x, (x.shape[-1],), weight=ln_w, bias=ln_b)
             sx = torch.cat((sx.unsqueeze(0), xx[:-1,:]))
             kx = xx * k_mix + sx * (1 - k_mix)
             vx = xx * v_mix + sx * (1 - v_mix)
             rx = xx * r_mix + sx * (1 - r_mix)
+            gx = xx * g_mix + sx * (1 - g_mix)
 
-            r = torch.sigmoid(self.mm8_seq(rx, rw, rmx, rrx, rmy, rry))
-            k = self.mm8_seq(kx, kw, kmx, krx, kmy, kry)
-            v = self.mm8_seq(vx, vw, vmx, vrx, vmy, vry)
-            y, aa, bb, pp = cuda_wkv(T, C, t_decay, t_first, k, v, aa, bb, pp)
+            r = matmul(rx, rw, rmx, rrx, rmy, rry, output_dtype=torch.float32)
+            k = matmul(kx, kw, kmx, krx, kmy, kry, output_dtype=torch.float32)
+            v = matmul(vx, vw, vmx, vrx, vmy, vry, output_dtype=torch.float32)
+            g = F.silu(matmul(gx, gw, gmx, grx, gmy, gry))
 
-            out = self.mm8_seq(r * y, ow, omx, orx, omy, ory)
-            return x + out, xx[-1,:], aa, bb, pp
+            return r, k, v, g, xx[-1,:], s.transpose(-1,-2).contiguous()
+
+        @MyFunction
+        def v5_2_after(self, t_decay, out, s, x, xxx, g, lx_w, lx_b, ow, omx, orx, omy, ory):
+            H = t_decay.shape[0]
+            N = x.shape[-1] // H
+            T = x.shape[0]
+
+            s = s.transpose(-1,-2)
+            out = out.reshape(T, H*N)
+            out = F.group_norm(out, num_groups=H, weight=lx_w, bias=lx_b, eps = 64e-5)
+            out = out.to(dtype=x.dtype) * g
+            out = matmul(out, ow, omx, orx, omy, ory)
+
+            return x + out, xxx, s
+
+        def cuda_att_seq_v5_2(self, x, sx, s, ln_w, ln_b, lx_w, lx_b, k_mix, v_mix, r_mix, g_mix, t_decay, t_first, kw, vw, rw, gw, ow, kmx, krx, kmy, kry, vmx, vrx, vmy, vry, rmx, rrx, rmy, rry, gmx, grx, gmy, gry, omx, orx, omy, ory):
+            H = t_decay.shape[0]
+            N = x.shape[-1] // H
+            T = x.shape[0]
+
+            r, k, v, g, xxx, ss = self.v5_2_before(x, sx, s, ln_w, ln_b, lx_w, lx_b, k_mix, v_mix, r_mix, g_mix, t_decay, t_first, kw, vw, rw, gw, ow, kmx, krx, kmy, kry, vmx, vrx, vmy, vry, rmx, rrx, rmy, rry, gmx, grx, gmy, gry, omx, orx, omy, ory)
+
+            out, s = self.RUN_RWKV_5(1, T, self.args.n_att, H, ss, r, k, v, w=t_decay, u=t_first)
+
+            return self.v5_2_after(t_decay, out, s, x, xxx, g, lx_w, lx_b, ow, omx, orx, omy, ory)
+
+        @MyFunction
+        def v6_0_before(self, x, sx, s, ln_w, ln_b, lx_w, lx_b, x_maa, w_maa, k_maa, v_maa, r_maa, g_maa, tm_w1, tm_w2, td_w1, td_w2, t_decay, t_first, kw, vw, rw, gw, ow, kmx, krx, kmy, kry, vmx, vrx, vmy, vry, rmx, rrx, rmy, rry, gmx, grx, gmy, gry, omx, orx, omy, ory):
+            H = t_decay.shape[0]
+            N = x.shape[-1] // H
+            T = x.shape[0]
+
+            xx = F.layer_norm(x, (x.shape[-1],), weight=ln_w, bias=ln_b)
+            sx = torch.cat((sx.unsqueeze(0), xx[:-1,:])) - xx
+            xxx = xx + sx * x_maa
+            xxx = torch.tanh(xxx @ tm_w1).view(T, 5, -1).transpose(0, 1)
+            xxx = torch.bmm(xxx, tm_w2).view(5, T, -1)
+            mw, mk, mv, mr, mg = xxx.unbind(dim=0)
+
+            wx = xx + sx * (w_maa + mw)
+            kx = xx + sx * (k_maa + mk)
+            vx = xx + sx * (v_maa + mv)
+            rx = xx + sx * (r_maa + mr)
+            gx = xx + sx * (g_maa + mg)
+
+            r = matmul(rx, rw, rmx, rrx, rmy, rry, output_dtype=torch.float32)
+            k = matmul(kx, kw, kmx, krx, kmy, kry, output_dtype=torch.float32)
+            v = matmul(vx, vw, vmx, vrx, vmy, vry, output_dtype=torch.float32)
+            g = F.silu(matmul(gx, gw, gmx, grx, gmy, gry))
+
+            w = t_decay.view(1, H, N, 1) + (torch.tanh(wx @ td_w1) @ td_w2).float().view(T, H, N, 1)
+
+            return r, k, v, g, w, xx[-1,:], s.transpose(-1,-2).contiguous()
+
+        def cuda_att_seq_v6_0(self, x, sx, s, ln_w, ln_b, lx_w, lx_b, x_maa, w_maa, k_maa, v_maa, r_maa, g_maa, tm_w1, tm_w2, td_w1, td_w2, t_decay, t_first, kw, vw, rw, gw, ow, kmx, krx, kmy, kry, vmx, vrx, vmy, vry, rmx, rrx, rmy, rry, gmx, grx, gmy, gry, omx, orx, omy, ory):
+            H = t_decay.shape[0]
+            N = x.shape[-1] // H
+            T = x.shape[0]
+
+            r, k, v, g, w, xxx, ss = self.v6_0_before(x, sx, s, ln_w, ln_b, lx_w, lx_b, x_maa, w_maa, k_maa, v_maa, r_maa, g_maa, tm_w1, tm_w2, td_w1, td_w2, t_decay, t_first, kw, vw, rw, gw, ow, kmx, krx, kmy, kry, vmx, vrx, vmy, vry, rmx, rrx, rmy, rry, gmx, grx, gmy, gry, omx, orx, omy, ory)
+
+            out, s = self.RUN_RWKV_6(1, T, self.args.n_att, H, ss, r, k, v, w=w, u=t_first)
+            return self.v5_2_after(t_decay, out, s, x, xxx, g, lx_w, lx_b, ow, omx, orx, omy, ory)
 
     ########################################################################################################
 
@@ -687,18 +1013,18 @@ class RWKV(MyModule):
                         dev = dd.device
                         atype = dd.atype
                         state[i*5+0] = torch.zeros(args.n_embd, dtype=atype, requires_grad=False, device=dev).contiguous()
-                        state[i*5+1] = torch.zeros(args.n_embd, dtype=torch.float, requires_grad=False, device=dev).contiguous()
-                        state[i*5+2] = torch.zeros(args.n_embd, dtype=torch.float, requires_grad=False, device=dev).contiguous()
-                        state[i*5+3] = torch.zeros(args.n_embd, dtype=torch.float, requires_grad=False, device=dev).contiguous() - 1e30
+                        state[i*5+1] = torch.zeros(args.n_att, dtype=torch.float, requires_grad=False, device=dev).contiguous()
+                        state[i*5+2] = torch.zeros(args.n_att, dtype=torch.float, requires_grad=False, device=dev).contiguous()
+                        state[i*5+3] = torch.zeros(args.n_att, dtype=torch.float, requires_grad=False, device=dev).contiguous() - 1e30
                         state[i*5+4] = torch.zeros(args.n_embd, dtype=atype, requires_grad=False, device=dev).contiguous()
-                elif self.version == 5:
+                elif int(self.version) in [5,6]:
                     state = [None] * args.n_layer * 3
                     for i in range(args.n_layer): # state: 0=att_xx 1=att_kv 2=ffn_xx
                         dd = self.strategy[i]
                         dev = dd.device
                         atype = dd.atype
                         state[i*3+0] = torch.zeros(args.n_embd, dtype=atype, requires_grad=False, device=dev).contiguous()
-                        state[i*3+1] = torch.zeros((args.n_head, args.n_embd//args.n_head, args.n_embd//args.n_head), dtype=torch.float, requires_grad=False, device=dev).contiguous()
+                        state[i*3+1] = torch.zeros((args.n_head, args.n_att//args.n_head, args.n_att//args.n_head), dtype=torch.float, requires_grad=False, device=dev).contiguous()
                         state[i*3+2] = torch.zeros(args.n_embd, dtype=atype, requires_grad=False, device=dev).contiguous()
 
             seq_mode = len(tokens) > 1
@@ -714,18 +1040,39 @@ class RWKV(MyModule):
                 atype = dd.atype
                 wtype = dd.wtype
                 if seq_mode:
-                    if 'cuda' in str(dev) and os.environ["RWKV_CUDA_ON"] == '1':
-                        ATT = self.cuda_att_seq if wtype != torch.uint8 else self.cuda_att_seq_i8
+                    cuda_applicable = os.environ["RWKV_CUDA_ON"] == '1' and 'cuda' in str(dev)
+                    if cuda_applicable:
+                        ATT = self.cuda_att_seq
                     else:
-                        ATT = self.att_seq if wtype != torch.uint8 else self.att_seq_i8
+                        ATT = self.att_seq
                     if self.version == 5:
                         ATT = self.att_seq_v5
-                    FFN = self.ffn_seq if wtype != torch.uint8 else self.ffn_seq_i8
+                    elif self.version == 5.1:
+                        ATT = self.att_seq_v5_1
+                    elif self.version == 5.2:
+                        ATT = self.att_seq_v5_2
+                        if cuda_applicable:
+                            ATT = self.cuda_att_seq_v5_2
+                    elif self.version == 6.0:
+                        ATT = self.att_seq_v6_0
+                        if cuda_applicable:
+                            ATT = self.cuda_att_seq_v6_0
+                    FFN = self.ffn_seq
+                    if self.version >= 6.0:
+                        FFN = self.ffn_seq_v6
                 else:
-                    ATT = self.att_one if wtype != torch.uint8 else self.att_one_i8
+                    ATT = self.att_one
                     if self.version == 5:
                         ATT = self.att_one_v5
-                    FFN = self.ffn_one if wtype != torch.uint8 else self.ffn_one_i8
+                    elif self.version == 5.1:
+                        ATT = self.att_one_v5_1
+                    elif self.version == 5.2:
+                        ATT = self.att_one_v5_1 # same as v5.1
+                    elif self.version == 6.0:
+                        ATT = self.att_one_v6_0
+                    FFN = self.ffn_one
+                    if self.version >= 6.0:
+                        FFN = self.ffn_one_v6
 
                 x = x.to(dtype=atype, device=dev)
 
@@ -754,6 +1101,14 @@ class RWKV(MyModule):
                 orx = w[f'{att}output.weight_rx'] if wtype == torch.uint8 else x
                 omy = w[f'{att}output.weight_my'] if wtype == torch.uint8 else x
                 ory = w[f'{att}output.weight_ry'] if wtype == torch.uint8 else x
+                if self.version in [5.1, 5.2, 6.0]:
+                    gw = w[f'{att}gate.weight']
+                    if dd.stream:
+                        gw = gw.to(device=dev, non_blocking=True)
+                    gmx = w[f'{att}gate.weight_mx'] if wtype == torch.uint8 else x
+                    grx = w[f'{att}gate.weight_rx'] if wtype == torch.uint8 else x
+                    gmy = w[f'{att}gate.weight_my'] if wtype == torch.uint8 else x
+                    gry = w[f'{att}gate.weight_ry'] if wtype == torch.uint8 else x
                 if self.version == 4:
                     x, state[i*5+0], state[i*5+1], state[i*5+2], state[i*5+3] = ATT(
                         x, state[i*5+0], state[i*5+1], state[i*5+2], state[i*5+3],
@@ -779,8 +1134,39 @@ class RWKV(MyModule):
                         rmx, rrx, rmy, rry,
                         omx, orx, omy, ory,
                         )
+                elif self.version in [5.1, 5.2]:
+                    x, state[i*3+0], state[i*3+1] = ATT(
+                        x, state[i*3+0], state[i*3+1],
+                        w[f'{bbb}ln1.weight'], w[f'{bbb}ln1.bias'],
+                        w[f'{att}ln_x.weight'], w[f'{att}ln_x.bias'],
+                        w[f'{att}time_mix_k'], w[f'{att}time_mix_v'], w[f'{att}time_mix_r'], w[f'{att}time_mix_g'],
+                        w[f'{att}time_decay'], w[f'{att}time_first'],
+                        kw, vw, rw, gw, ow,
+                        kmx, krx, kmy, kry,
+                        vmx, vrx, vmy, vry,
+                        rmx, rrx, rmy, rry,
+                        gmx, grx, gmy, gry,
+                        omx, orx, omy, ory,
+                        )
+                elif self.version == 6.0:
+                    x, state[i*3+0], state[i*3+1] = ATT(
+                        x, state[i*3+0], state[i*3+1],
+                        w[f'{bbb}ln1.weight'], w[f'{bbb}ln1.bias'],
+                        w[f'{att}ln_x.weight'], w[f'{att}ln_x.bias'],
+                        w[f'{att}time_maa_x'], w[f'{att}time_maa_w'], w[f'{att}time_maa_k'], w[f'{att}time_maa_v'], w[f'{att}time_maa_r'], w[f'{att}time_maa_g'],
+                        w[f'{att}time_maa_w1'], w[f'{att}time_maa_w2'], w[f'{att}time_decay_w1'], w[f'{att}time_decay_w2'],
+                        w[f'{att}time_decay'], w[f'{att}time_first'],
+                        kw, vw, rw, gw, ow,
+                        kmx, krx, kmy, kry,
+                        vmx, vrx, vmy, vry,
+                        rmx, rrx, rmy, rry,
+                        gmx, grx, gmy, gry,
+                        omx, orx, omy, ory,
+                        )
                 if dd.stream:
                     del kw, vw, rw, ow
+                    if self.version in [5.1, 5.2, 6.0]:
+                        del gw
 
                 kw = w[f'{ffn}key.weight']
                 vw = w[f'{ffn}value.weight']
@@ -803,17 +1189,28 @@ class RWKV(MyModule):
                 rry = w[f'{ffn}receptance.weight_ry'] if wtype == torch.uint8 else x
                 if self.version == 4:
                     offset = i*5+4
-                elif self.version == 5:
+                elif int(self.version) in [5,6]:
                     offset = i*3+2
-                x, state[offset] = FFN(
-                    x, state[offset],
-                    w[f'{bbb}ln2.weight'], w[f'{bbb}ln2.bias'],
-                    w[f'{ffn}time_mix_k'], w[f'{ffn}time_mix_r'],
-                    kw, vw, rw,
-                    kmx, krx, kmy, kry,
-                    vmx, vrx, vmy, vry,
-                    rmx, rrx, rmy, rry,                    
-                    )
+                if self.version < 6.0:
+                    x, state[offset] = FFN(
+                        x, state[offset],
+                        w[f'{bbb}ln2.weight'], w[f'{bbb}ln2.bias'],
+                        w[f'{ffn}time_mix_k'], w[f'{ffn}time_mix_r'],
+                        kw, vw, rw,
+                        kmx, krx, kmy, kry,
+                        vmx, vrx, vmy, vry,
+                        rmx, rrx, rmy, rry,                    
+                        )
+                else:
+                    x, state[offset] = FFN(
+                        x, state[offset],
+                        w[f'{bbb}ln2.weight'], w[f'{bbb}ln2.bias'],
+                        w[f'{ffn}time_maa_k'], w[f'{ffn}time_maa_r'],
+                        kw, vw, rw,
+                        kmx, krx, kmy, kry,
+                        vmx, vrx, vmy, vry,
+                        rmx, rrx, rmy, rry,                    
+                        )
                 if dd.stream:                
                     del kw, vw, rw
                 
@@ -830,8 +1227,8 @@ class RWKV(MyModule):
                 x = x @ w['head.weight']
             else:
                 if seq_mode and full_output:
-                    x = self.mm8_seq(x, w['head.weight'], w['head.weight_mx'], w['head.weight_rx'], w['head.weight_my'], w['head.weight_ry'])
+                    x = mm8_seq(x, w['head.weight'], w['head.weight_mx'], w['head.weight_rx'], w['head.weight_my'], w['head.weight_ry'])
                 else:
-                    x = self.mm8_one(x, w['head.weight'], w['head.weight_mx'], w['head.weight_rx'], w['head.weight_my'], w['head.weight_ry'])
+                    x = mm8_one(x, w['head.weight'], w['head.weight_mx'], w['head.weight_rx'], w['head.weight_my'], w['head.weight_ry'])
 
             return x.float(), state

@@ -1,13 +1,28 @@
 # ChatRWKV (pronounced as "RwaKuv", from 4 major params: R W K V)
-ChatRWKV is like ChatGPT but powered by my RWKV (100% RNN) language model, which is the only RNN (as of now) that can match transformers in quality and scaling, while being faster and saves VRAM. Training sponsored by Stability EleutherAI :) **中文使用教程，请往下看，在本页面底部。**
 
-**Raven 14B** (finetuned on Alpaca+ShareGPT+...) Demo: https://huggingface.co/spaces/BlinkDL/ChatRWKV-gradio
+> RWKV homepage: https://www.rwkv.com/ https://wiki.rwkv.com/
 
-**World 7B** (supports 100+ world languages) Demo: https://huggingface.co/spaces/BlinkDL/RWKV-World-7B
+ChatRWKV is like ChatGPT but powered by my RWKV (100% RNN) language model, which is the only RNN (as of now) that can match transformers in quality and scaling, while being faster and saves VRAM. Training sponsored by Stability EleutherAI :)
 
-**Download RWKV-4 weights:** https://huggingface.co/BlinkDL (**Use RWKV-4 models**. DO NOT use RWKV-4a and RWKV-4b models.)
+Our latest version is **RWKV-6**, which is easily Mamba level, and simpler ;) https://twitter.com/BlinkDL_AI/status/1732791817073229881 https://twitter.com/BlinkDL_AI/status/1713967928209752128 (Preview models: https://huggingface.co/BlinkDL/temp )
 
-Note: RWKV-4-World is the best model: generation & chat & code in 100+ world languages, with the best English zero-shot & in-context learning ability too.
+**RWKV-5 World v2 1.5B** Demo: https://huggingface.co/spaces/BlinkDL/RWKV-Gradio-1
+
+**RWKV-5 World v2 3B** Demo: https://huggingface.co/spaces/BlinkDL/RWKV-Gradio-2
+
+![RWKV-v5-benchmark-1](RWKV-v5-benchmark-1.png)
+
+**RWKV-LM main repo**: https://github.com/BlinkDL/RWKV-LM (explanation, fine-tuning, training, etc.)
+
+## RWKV Discord: https://discord.gg/bDSBUMeFpc (7k+ members)
+
+**Twitter**: https://twitter.com/BlinkDL_AI
+
+**Homepage**: https://www.rwkv.com/
+
+**Raw cutting-edge RWKV weights:** https://huggingface.co/BlinkDL
+
+**HF-compatible RWKV weights:** https://huggingface.co/RWKV
 
 Use v2/convert_model.py to convert a model for a strategy, for faster loading & saves CPU RAM.
 
@@ -21,25 +36,41 @@ Install VS2022 build tools (https://aka.ms/vs/17/release/vs_BuildTools.exe selec
 ```
 **RWKV pip package**: https://pypi.org/project/rwkv/ **(please always check for latest version and upgrade)**
 
+**nanoRWKV**: https://github.com/BlinkDL/nanoRWKV (does not require custom CUDA kernel to train, works for any GPU/CPU)
+
+https://github.com/cgisky1980/ai00_rwkv_server Fastest GPU inference API with vulkan (good for nvidia/amd/intel), supports rwkv5
+
+https://github.com/cryscan/web-rwkv backend for ai00_rwkv_server, supports rwkv5
+
+https://github.com/saharNooby/rwkv.cpp Fast CPU/cuBLAS/CLBlast inference: int4/int8/fp16/fp32, supports rwkv5
+
+https://github.com/daquexian/faster-rwkv supports rwkv5
+
+https://github.com/mlc-ai/mlc-llm/pull/1275 supports rwkv5
+
+https://github.com/RWKV/RWKV-infctx-trainer Infctx trainer
+
+https://github.com/Blealtan/RWKV-LM-LoRA LoRA finetuning
+
 **World demo script:** https://github.com/BlinkDL/ChatRWKV/blob/main/API_DEMO_WORLD.py
 
 **Raven Q&A demo script:** https://github.com/BlinkDL/ChatRWKV/blob/main/v2/benchmark_more.py
 
 ![ChatRWKV-strategy](ChatRWKV-strategy.png)
 
-## RWKV Discord: https://discord.gg/bDSBUMeFpc (let's build together)
-
-**Twitter:** https://twitter.com/BlinkDL_AI
-
-**RWKV LM:** https://github.com/BlinkDL/RWKV-LM (explanation, fine-tuning, training, etc.)
-
 **RWKV in 150 lines** (model, inference, text generation): https://github.com/BlinkDL/ChatRWKV/blob/main/RWKV_in_150_lines.py
 
-**Building your own RWKV inference engine:** begin with https://github.com/BlinkDL/ChatRWKV/blob/main/src/model_run.py which is easier to understand (used by https://github.com/BlinkDL/ChatRWKV/blob/main/chat.py).
+**🔥 RWKV v5 in 250 lines 🔥** (with tokenizer too): https://github.com/BlinkDL/ChatRWKV/blob/main/RWKV_v5_demo.py
+
+**🔥 Building your own RWKV inference engine 🔥**: begin with https://github.com/BlinkDL/ChatRWKV/blob/main/src/model_run.py which is easier to understand (used by https://github.com/BlinkDL/ChatRWKV/blob/main/chat.py).
 
 **RWKV preprint** https://arxiv.org/abs/2305.13048
 
 ![RWKV-paper](RWKV-paper.png)
+
+RWKV v6 illustrated:
+
+![RWKV-v6](rwkv-x060.png)
 
 **Cool Community RWKV Projects**:
 
@@ -75,6 +106,8 @@ Here is https://huggingface.co/BlinkDL/rwkv-4-raven/blob/main/RWKV-4-Raven-14B-v
 When you build a RWKV chatbot, always check the text corresponding to the state, in order to prevent bugs.
 
 1. Never call raw forward() directly. Instead, put it in a function that will record the text corresponding to the state.
+
+**(For v4-raven models, use Bob/Alice. For v4/v5/v6-world models, use User/Assistant)**
 
 2. The best chat format (check whether your text is of this format):
 ```Bob: xxxxxxxxxxxxxxxxxx\n\nAlice: xxxxxxxxxxxxx\n\nBob: xxxxxxxxxxxxxxxx\n\nAlice:```

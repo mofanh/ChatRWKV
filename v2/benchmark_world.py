@@ -13,9 +13,9 @@ import numpy as np
 np.set_printoptions(precision=4, suppress=True, linewidth=200)
 
 os.environ["RWKV_JIT_ON"] = '1'
-os.environ["RWKV_CUDA_ON"] = '0'
+os.environ["RWKV_CUDA_ON"] = '0' # set to 1 for much faster generation
 
-MODEL_NAME = '/fsx/BlinkDL/HF-MODEL/rwkv-4-world/RWKV-4-World-0.1B-v1-20230520-ctx4096'
+MODEL_NAME = '/fsx/BlinkDL/HF-MODEL/rwkv-5-world/RWKV-5-World-0.4B-v2-20231113-ctx4096'
 
 print(f'\nLoading ChatRWKV https://github.com/BlinkDL/ChatRWKV')
 import torch
@@ -28,8 +28,8 @@ from rwkv.model import RWKV
 from rwkv.utils import PIPELINE, PIPELINE_ARGS
 
 print(f'Loading model - {MODEL_NAME}')
-model = RWKV(model=MODEL_NAME, strategy='cuda fp32') # !!! currenly World models will overflow in fp16 !!!
-pipeline = PIPELINE(model, "rwkv_vocab_v20230424") # !!! update rwkv pip package to 0.7.4+ !!!
+model = RWKV(model=MODEL_NAME, strategy='cuda fp16')
+pipeline = PIPELINE(model, "rwkv_vocab_v20230424") # !!! update rwkv pip package to 0.8+ !!!
 
 ########################################################################################################
 
@@ -88,14 +88,14 @@ for q in QUESTIONS:
     out_str = ''
     occurrence = {}
     state = None
-    ctx = f'Question: {q.strip()}\n\nAnswer:' # !!! do not use Q/A (corrupted by a dataset) or Bob/Alice (not used in training) !!!
+    ctx = f'User: {q.strip()}\n\nAssistant:'
     print(ctx, end = '')
     for i in range(200):
         tokens = PAD_TOKENS + pipeline.encode(ctx) if i == 0 else [token]
         
         out, state = pipeline.model.forward(tokens, state)
         for n in occurrence:
-            out[n] -= (0.4 + occurrence[n] * 0.4) # repetition penalty
+            out[n] -= (0 + occurrence[n] * 1.0) # repetition penalty
         
         token = pipeline.sample_logits(out, temperature=1.0, top_p=0.1)
         if token == 0: break # exit when 'endoftext'
